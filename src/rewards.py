@@ -10,8 +10,6 @@ def math_binary_reward(prompts, completions, answer, **kwargs):
     rewards = []
     for completion, ground_truth in zip(completions, answer):
         pred = extract_math_answer(completion[0]['content'])
-        # Cần một hàm so sánh LaTeX (như sympy) ở đây để so sánh pred và ground_truth
-        # Tạm thời dùng so sánh chuỗi đơn giản
         if pred == ground_truth:
             rewards.append(1.0)
         else:
@@ -45,6 +43,23 @@ def dynamic_format_reward(prompts, completions, level, **kwargs):
                 lambda_val = 0.005
                 
             score -= (lambda_val * think_length)
+            
+        rewards.append(score)
+    return rewards
+
+def standard_format_reward(prompts, completions, **kwargs):
+    """
+    Phần thưởng định dạng tĩnh (Truyền thống).
+    Chỉ kiểm tra mô hình có tuân thủ format không, không phạt độ dài (Length Bias).
+    """
+    rewards = []
+    for completion in completions:
+        content = completion[0]['content']
+        score = 0.0
+        
+        # Thưởng 1.0 điểm nếu có đầy đủ cấu trúc suy luận và đáp án
+        if "<think>" in content and "</think>" in content and "<answer>" in content and "</answer>" in content:
+            score += 1.0
             
         rewards.append(score)
     return rewards
