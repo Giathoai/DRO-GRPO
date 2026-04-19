@@ -1,56 +1,50 @@
 import re
 
-def accuracy_reward(completions, ground_truth, **kwargs):
-    """Thưởng +1.0 nếu giải đúng Toán"""
+def extract_math_answer(text: str) -> str:
+    """Hàm trích xuất đáp án nằm trong thẻ \boxed{} của LaTeX"""
+    match = re.search(r"\\boxed\{(.*?)\}", text)
+    return match.group(1).strip() if match else None
+
+def math_binary_reward(prompts, completions, answer, **kwargs):
+    """Phần thưởng thưa thớt: Đúng +1, Sai -1 (Ép DRO hoạt động)"""
     rewards = []
-    for completion, truth in zip(completions, ground_truth):
-        match = re.search(r"<answer>(.*?)</answer>", completion, flags=re.DOTALL)
-        if match:
-            pred = match.group(1).strip()
-            # Làm sạch chuỗi trước khi so sánh
-            pred_clean = pred.replace(" ", "").lower()
-            truth_clean = truth.replace(" ", "").lower()
-            
-            if truth_clean != "" and pred_clean == truth_clean:
-                rewards.append(1.0)
-            elif truth_clean != "" and truth_clean in pred_clean:
-                rewards.append(0.5)
-            else:
-                rewards.append(0.0)
+    for completion, ground_truth in zip(completions, answer):
+        pred = extract_math_answer(completion[0]['content'])
+        # Cần một hàm so sánh LaTeX (như sympy) ở đây để so sánh pred và ground_truth
+        # Tạm thời dùng so sánh chuỗi đơn giản
+        if pred == ground_truth:
+            rewards.append(1.0)
         else:
-            rewards.append(0.0)
+            rewards.append(-1.0)
     return rewards
 
-def format_reward(completions, **kwargs):
-    """Thưởng +0.5 nếu mở đóng thẻ đúng chuẩn"""
+def dynamic_format_reward(prompts, completions, level, **kwargs):
+    """Phần thưởng định dạng kết hợp Adaptive Compute Penalty"""
     rewards = []
-    for completion in completions:
-        if "<think>" in completion and "</think>" in completion and \
-           "<answer>" in completion and "</answer>" in completion:
-            rewards.append(0.5)
-        else:
-            rewards.append(0.0)
-    return rewards
-
-def length_penalty_reward(completions, level, **kwargs):
-
-    rewards = []
-    
-    for i, completion in enumerate(completions):
-        current_level = level[i] if isinstance(level, list) else level
+    for completion, lvl in zip(completions, level):
+        content = completion[0]['content']
+        score = 0.0
         
-        if "Level 1" in current_level:
-            lambda_penalty = 0.01   
-        elif "Level 2" in current_level:
-            lambda_penalty = 0.005  
-        else:
-            lambda_penalty = 0.001  
-
-        match = re.search(r"<think>(.*?)</think>", completion, flags=re.DOTALL)
-        if match:
-            think_length = len(match.group(1).split())
-            rewards.append(-lambda_penalty * think_length)
-        else:
-            rewards.append(0.0)
+        # Mồi nhử (Reward Shaping) cho SLM 1.5B
+        if "<think>" in content and "</think>" in content:
+            score += 0.5
             
+        # Áp dụng Dynamic Penalty (Phạt Overthinking)
+        think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
+        if think_match:
+            think_length = len(think_match.group(1))
+            
+            # Map hệ số phạt theo Level (Độ khó tĩnh)
+            if "Level 1" in lvl:
+                lambda_val = 0.010  # Dễ -> Phạt nặng, ép nghĩ nhanh
+            elif "Level 2" in lvl:
+                lambda_val = 0.005  # Vừa -> Phạt trung bình
+            elif "Level 3" in lvl:
+                lambda_val = 0.001  # Khó -> Phạt rất nhẹ, cho phép nghĩ sâu
+            else:
+                lambda_val = 0.005
+                
+            score -= (lambda_val * think_length)
+            
+        rewards.append(score)
     return rewards
