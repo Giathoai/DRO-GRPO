@@ -1,8 +1,16 @@
-torch>=2.1.0
-transformers>=4.40.0
-trl>=0.8.0
-datasets
-accelerate
-peft
-wandb
-pyyaml
+torch>=2.6.0
+numpy>=2.2.6
+
+# Hugging Face Ecosystem
+transformers>=4.53.0
+datasets>=3.1.0
+huggingface_hub>=0.30.0
+accelerate>=1.2.0
+peft>=0.15.0
+trl>=0.15.0
+optimum>=1.25.0
+
+# Data Science & Visualization (Upgraded for Numpy 2.x compatibility)
+matplotlib>=3.10.0
+scipy>=1.14.0
+scikit-learn>=1.6.0

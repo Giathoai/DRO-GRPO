@@ -1,92 +1,142 @@
 import torch
+import sys
+import os
+import random
+from trl import SFTConfig, SFTTrainer
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback
 from datasets import load_dataset
-from unsloth import FastLanguageModel
-from trl import SFTTrainer
-from transformers import TrainingArguments
-from unsloth.chat_templates import get_chat_template
+from peft import LoraConfig, get_peft_model
 
-# 1. Cấu hình Model với Unsloth (Tối ưu cho GPU VRAM thấp)
-max_seq_length = 2048 
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="Qwen/Qwen2.5-1.5B-Instruct",
-    max_seq_length=max_seq_length,
-    load_in_4bit=True, 
-    fast_inference=True,
-)
+class SFTVisualizerCallback(TrainerCallback):
+    def __init__(self, tokenizer, dataset, sample_every=50):
+        self.tokenizer = tokenizer
+        self.dataset = dataset
+        self.sample_every = sample_every
 
-# 2. Thêm LoRA Adapters
-model = FastLanguageModel.get_peft_model(
-    model,
-    r=16,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    lora_alpha=32,
-    use_gradient_checkpointing="unsloth",
-    random_state=3407,
-)
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if state.global_step % self.sample_every == 0 and state.global_step > 0:
+            model = kwargs['model']
+            model.eval()
+            
+            idx = random.randint(0, len(self.dataset) - 1)
+            item = self.dataset[idx]
+            
+            messages = item["messages"]
+            # Ground truth lúc này sẽ chứa nội dung từ cột 'generations'
+            ground_truth = messages[1]["content"]
+            
+            input_messages = messages[:1] 
+            text = self.tokenizer.apply_chat_template(input_messages, tokenize=False, add_generation_prompt=True)
+            
+            inputs = self.tokenizer(text, return_tensors="pt").to(model.device)
 
-# 3. Áp dụng chuẩn Chat Template của Qwen
-tokenizer = get_chat_template(
-    tokenizer,
-    chat_template="qwen-2.5",
-)
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **inputs, 
+                    max_new_tokens=512,
+                    do_sample=True,
+                    temperature=0.7
+                )
+                generated_ids_trimmed = [
+                    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+                ]
+                output_text = self.tokenizer.batch_decode(
+                    generated_ids_trimmed, skip_special_tokens=True
+                )[0]
 
-def format_dataset(examples):
-    """
-    Chuyển đổi problem và solution từ OpenR1 thành định dạng hội thoại messages.
-    """
-    messages = []
-    for problem, solution in zip(examples["problem"], examples["solution"]):
-        messages.append([
-            {"role": "user", "content": problem},
-            {"role": "assistant", "content": solution}
-        ])
-    return {"messages": messages}
+            print("\n" + "=" * 50)
+            print(f"📊 [SFT DEBUG] STEP: {state.global_step}")
+            print(f"✅ [GROUND TRUTH (from generations)]:\n{ground_truth[:300]}...")
+            print(f"🤖 [MODEL OUTPUT]:\n{output_text}")
+            print("=" * 50 + "\n")
+            
+            model.train()
 
-# 4. Tải và xử lý dataset
-print("Tải dataset OpenR1-Math-220k...")
-# Tải dataset, có thể tải một phần để tiết kiệm thời gian mapping
-dataset = load_dataset("open-r1/OpenR1-Math-220k", split="default")
+def train_sft_warmup(model_id: str, output_dir: str):
+    # 1. Load Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-# Xào trộn (shuffle) và áp dụng format
-dataset = dataset.shuffle(seed=42).map(format_dataset, batched=True, remove_columns=dataset.column_names)
+    # 2. Load Model (BF16, No Quantization)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        device_map="auto",
+        torch_dtype=torch.bfloat16, 
+        trust_remote_code=True
+    )
 
-# Sử dụng hàm apply_chat_template tích hợp sẵn của Unsloth để biến dictionary thành chuỗi text
-def apply_template(examples):
-    texts = [tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=False) for msg in examples["messages"]]
-    return {"text": texts}
+    # 3. Cấu hình LoRA
+    peft_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, peft_config)
 
-dataset = dataset.map(apply_template, batched=True)
+    # 4. Dataset Processing - CẬP NHẬT CỘT 'generations'
+    print("⏳ Loading dataset OpenR1-Math-220k...")
+    raw_dataset = load_dataset("open-r1/OpenR1-Math-220k", split="train")
+    
+    def formatting_prompts_func(example):
+        # Lưu ý: Cột 'generations' thường là một danh sách (list), 
+        # ta lấy phần tử đầu tiên là lời giải mẫu chuẩn.
+        generation_content = example["generations"]
+        if isinstance(generation_content, list):
+            generation_content = generation_content[0]
 
-# 5. Cấu hình SFT Trainer
-trainer = SFTTrainer(
-    model=model,
-    tokenizer=tokenizer,
-    train_dataset=dataset,
-    dataset_text_field="text",
-    max_seq_length=max_seq_length,
-    dataset_num_proc=2,
-    args=TrainingArguments(
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
-        warmup_steps=20,
-        max_steps=200,            # CHỈ TRAIN 200 STEPS THEO YÊU CẦU
-        learning_rate=2e-5,       # LR nhỏ để model không quên kiến thức gốc
-        fp16=not torch.cuda.is_bf16_supported(),
-        bf16=torch.cuda.is_bf16_supported(),
-        logging_steps=10,
-        optim="adamw_8bit",
-        weight_decay=0.01,
-        lr_scheduler_type="linear",
-        seed=3407,
-        output_dir="outputs/SFT-checkpoint",
-    ),
-)
+        return {
+            "messages": [
+                {"role": "user", "content": example["problem"]},
+                {"role": "assistant", "content": generation_content}
+            ]
+        }
 
-# 6. Bắt đầu huấn luyện SFT
-print("🚀 Bắt đầu Warm-up SFT...")
-trainer.train()
+    # Chọn 5000 mẫu để warm-up nhanh
+    sft_dataset = raw_dataset.shuffle(seed=42).select(range(5000)).map(formatting_prompts_func)
 
-# 7. Lưu Adapter SFT
-print("💾 Lưu LoRA Adapter...")
-model.save_pretrained("outputs/Qwen-1.5B-SFT-Adapter")
-tokenizer.save_pretrained("outputs/Qwen-1.5B-SFT-Adapter")
+    # 5. SFTConfig
+    training_args = SFTConfig(
+        output_dir=output_dir,
+        dataset_text_field="messages", 
+        max_seq_length=2048,
+        learning_rate=2e-5,          
+        lr_scheduler_type="cosine",
+        logging_steps=10,           
+        max_steps=200, 
+        per_device_train_batch_size=2, 
+        gradient_accumulation_steps=4, 
+        gradient_checkpointing=True, 
+        bf16=True,                                   
+        remove_unused_columns=False, 
+        save_steps=100,
+        report_to="none",
+    )
+
+    visualizer = SFTVisualizerCallback(tokenizer, sft_dataset, sample_every=50)
+
+    # 6. Trainer
+    trainer = SFTTrainer(
+        model=model,
+        train_dataset=sft_dataset,
+        args=training_args,
+        processing_class=tokenizer,
+        callbacks=[visualizer], 
+    )
+
+    print("🚀 Bắt đầu Warm-up SFT với cột Generations (Full Precision)...")
+    trainer.train()
+    
+    # 7. Lưu kết quả
+    trainer.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
+    print(f"💾 Đã lưu Adapter tại: {output_dir}")
+
+if __name__ == "__main__":
+    train_sft_warmup(
+        model_id="Qwen/Qwen2.5-1.5B-Instruct",
+        output_dir="outputs/Qwen-1.5B-SFT-Adapter"
+    )
