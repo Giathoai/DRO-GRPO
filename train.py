@@ -1,7 +1,11 @@
-import torch
+import sys
 import os
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import random
+from unittest.mock import MagicMock
+
+import torch
+from datasets import load_dataset, concatenate_datasets
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback
 from trl import GRPOConfig
 from peft import LoraConfig, get_peft_model, PeftModel
 
@@ -9,16 +13,78 @@ from peft import LoraConfig, get_peft_model, PeftModel
 from src.trainer import RobustGRPOTrainer
 from src.rewards import math_binary_reward, dynamic_format_reward
 
-def format_english_math(examples):
+class GRPOVisualizerCallback(TrainerCallback):
     """
-    Chuẩn bị dữ liệu Tiếng Anh (MATH):
-    Bọc prompt chuẩn Qwen và giữ lại cột 'level' cho Dynamic Reward.
+    Callback in ra quá trình suy luận và LƯU VÀO FILE TXT.
     """
+    def __init__(self, tokenizer, dataset, sample_every=10, log_file="outputs/DRO_GRPO_Reasoning_Logs.txt"):
+        self.tokenizer = tokenizer
+        self.dataset = dataset
+        self.sample_every = sample_every
+        self.log_file = log_file
+        
+        # Tạo thư mục chứa file log nếu chưa có
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+        
+        # Tạo file mới và ghi Header (Hỗ trợ UTF-8 cho tiếng Việt)
+        with open(self.log_file, "w", encoding="utf-8") as f:
+            f.write("=== NHẬT KÝ SUY LUẬN MÔ HÌNH DRO-GRPO ===\n\n")
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if state.global_step % self.sample_every == 0 and state.global_step > 0:
+            model = kwargs['model']
+            model.eval()
+            
+            # Chọn mẫu ngẫu nhiên
+            idx = random.randint(0, len(self.dataset) - 1)
+            item = self.dataset[idx]
+            
+            prompt = item["prompt"]
+            ground_truth = item["answer"]
+            problem = item.get("problem", "N/A")
+            
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
+            
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    do_sample=True,
+                    temperature=0.8,
+                    pad_token_id=self.tokenizer.pad_token_id
+                )
+                
+                completion_ids = generated_ids[0][len(inputs.input_ids[0]):]
+                output_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
+
+            # Đóng gói nội dung Log
+            log_content = (
+                f"{'='*60}\n"
+                f"🚀 [DRO-GRPO DEBUG] STEP: {state.global_step}\n"
+                f"❓ [QUESTION]:\n{problem}\n"
+                f"{'-'*60}\n"
+                f"✅ [GROUND TRUTH ANSWER]: {ground_truth}\n"
+                f"{'-'*60}\n"
+                f"🤖 [MODEL REASONING & OUTPUT]:\n{output_text}\n"
+                f"{'='*60}\n\n"
+            )
+
+            # 1. In ra Terminal cho bạn theo dõi trực tiếp
+            print(log_content)
+            
+            # 2. Ghi nối (append) vào file .txt
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(log_content)
+            
+            model.train()
+
+def format_vietnamese_math(examples):
     prompts = []
     for question in examples["problem"]:
         prompt = (
             "<|im_start|>system\n"
-            "You are a helpful math assistant. Please reason step by step and put your final answer within <answer> and </answer> tags.\n"
+            "You are a helpful math assistant. Please reason step by step and "
+            "The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively.\n"
             "<|im_end|>\n"
             "<|im_start|>user\n"
             f"{question}\n"
@@ -30,7 +96,8 @@ def format_english_math(examples):
     return {
         "prompt": prompts,
         "answer": examples["solution"], 
-        "level": examples["level"]
+        "level": examples["level"],
+        "problem": examples["problem"]
     }
 
 def main():
@@ -38,7 +105,6 @@ def main():
     sft_adapter_path = "outputs/Qwen-1.5B-SFT-Adapter"
     output_dir = "outputs/Qwen-1.5B-DRO-GRPO"
 
-    # 1. Nạp Model gốc và gộp (Merge) tri thức từ SFT Warm-up
     print(f"⏳ Đang nạp Base Model: {base_model_id}")
     tokenizer = AutoTokenizer.from_pretrained(base_model_id)
     tokenizer.pad_token = tokenizer.eos_token
@@ -57,7 +123,6 @@ def main():
         model = model.merge_and_unload()
         print("✅ Đã chuẩn bị xong mô hình nền tảng có tư duy CoT.")
 
-    # 2. Thiết lập LoRA mới cho pha Robust Optimization (DRO)
     peft_config = LoraConfig(
         r=16,
         lora_alpha=32,
@@ -68,46 +133,56 @@ def main():
     )
     model = get_peft_model(model, peft_config)
 
-    # 3. Xử lý dữ liệu English MATH
-    print("⏳ Đang chuẩn bị dữ liệu MATH (English)...")
-    dataset = load_dataset("hendrycks/competition_math", split="train")
-    dataset = dataset.map(format_english_math, batched=True, remove_columns=dataset.column_names)
+    configs = [
+        'algebra', 'counting_and_probability', 'geometry', 
+        'intermediate_algebra', 'number_theory', 'prealgebra', 'precalculus'
+    ]
+    print(f"⏳ Đang tải và gộp dữ liệu từ Vietnamese-MATH...")
+    
+    all_splits = []
+    for config_name in configs:
+        ds = load_dataset("ura-hcmut/Vietnamese-MATH", config_name, split="train")
+        all_splits.append(ds)
+    
+    dataset = concatenate_datasets(all_splits)
+    dataset = dataset.map(format_vietnamese_math, batched=True, remove_columns=dataset.column_names)
 
-    # 4. Cấu hình GRPO với vLLM Acceleration
     training_args = GRPOConfig(
         output_dir=output_dir,
-        learning_rate=1.5e-5,
+        learning_rate=1e-5,
+        optim="adamw_8bit",
+        lr_scheduler_type="cosine",
+        logging_steps=1,
+        max_steps=500, 
+        save_steps=50,               
+        save_total_limit=2, 
         per_device_train_batch_size=1, 
         gradient_accumulation_steps=8, 
         num_generations=4, 
         max_completion_length=1024,
-        max_steps=500, #hehehee
-        save_steps=10,               
-        save_total_limit=2, 
-        gradient_checkpointing=True, 
-        beta=0.001, 
-        logging_steps=1,
-        use_vllm=True, 
-        temperature=1.0, 
+        use_vllm=False, 
+        beta=0.04, 
         bf16=True,
         report_to="none",
     )
 
-    # 5. Khởi tạo Robust Trainer (Vũ khí chính: DRO + Annealing)
+    # Khởi tạo Visualizer LƯU FILE TXT (Log mỗi 10 steps)
+    visualizer = GRPOVisualizerCallback(tokenizer, dataset, sample_every=10, log_file="outputs/DRO_GRPO_Reasoning_Logs.txt")
+
     trainer = RobustGRPOTrainer(
         model=model,
         reward_funcs=[math_binary_reward, dynamic_format_reward],
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
-        dr_temp_start=100.0, # Bắt đầu bằng việc khám phá rộng (GRPO-like)
-        dr_temp_end=0.8,     # Kết thúc bằng việc tập trung vào Worst-case (DRO)
+        dr_temp_start=100.0, 
+        dr_temp_end=0.8,     
+        callbacks=[visualizer]
     )
 
     print("🚀 Bắt đầu huấn luyện DRO-GRPO (Proposed Method)...")
     trainer.train()
 
-    # 6. Lưu kết quả cuối cùng
     trainer.save_model(f"{output_dir}-Final")
     tokenizer.save_pretrained(f"{output_dir}-Final")
     print(f"💾 Hệ thống DRO-GRPO đã được lưu tại: {output_dir}-Final")

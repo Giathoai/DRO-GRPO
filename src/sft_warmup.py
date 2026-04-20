@@ -102,7 +102,7 @@ def train_sft_warmup(model_id: str, output_dir: str):
     training_args = SFTConfig(
         output_dir=output_dir,
         dataset_text_field="messages", 
-        max_seq_length=2048,
+        max_length=2048,
         learning_rate=2e-5,          
         lr_scheduler_type="cosine",
         logging_steps=10,           
