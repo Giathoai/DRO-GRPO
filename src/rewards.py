@@ -1,112 +1,156 @@
 import re
+import statistics
 from collections import defaultdict
+from math_verify import parse, verify
+# =====================================================================
+# 1. PRE-COMPILED REGEX
+# =====================================================================
+MATH_ANSWER_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+GT_BOXED_PATTERN = re.compile(r'\\boxed\{(.*?)\}')
 
+# Pattern chặt chẽ: Ép mở/đóng thẻ đúng thứ tự, không có rác ở ngoài
+STRICT_FORMAT_PATTERN = re.compile(r"^<think>(.*?)</think>\s*<answer>(.*?)</answer>$", re.DOTALL)
+
+# =====================================================================
+# 2. HELPER FUNCTIONS
+# =====================================================================
+def clean_math_str(text):
+    if not text:
+        return ""
+    return str(text).replace(",", "").replace("$", "").replace(" ", "").strip()
+
+def get_content(completion):
+    return completion[0]['content'] if isinstance(completion, list) else completion
+
+# =====================================================================
+# 3. EXTRACTION FUNCTIONS
+# =====================================================================
 def extract_math_answer(text):
-    """Trích xuất đáp án của MÔ HÌNH nằm trong thẻ <answer>...</answer>"""
-    match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
-    if match:
-        ans = match.group(1).strip()
-        ans = ans.replace(",", "").replace("$", "").replace(" ", "")
-        return ans
-    return None
+    match = MATH_ANSWER_PATTERN.search(text)
+    return clean_math_str(match.group(1)) if match else None
 
 def extract_ground_truth(text):
-    """Trích xuất đáp án CHUẨN từ dataset (nằm trong \boxed{...})"""
-    text = str(text)
-    # Ưu tiên 1: Lấy trong thẻ \boxed{}
-    match = re.search(r'\\boxed\{(.*?)\}', text)
-    if match:
-        ans = match.group(1).strip()
-    else:
-        # Fallback: Nếu không có \boxed, lấy khối chữ cuối cùng
-        ans = text.split()[-1] if text.split() else text
+    text_str = str(text)
+    match = GT_BOXED_PATTERN.search(text_str)
     
-    return ans.replace(",", "").replace("$", "").replace(" ", "").strip()
+    if match:
+        raw_ans = match.group(1)
+    else:
+        parts = text_str.split()
+        raw_ans = parts[-1] if parts else text_str
+        
+    return clean_math_str(raw_ans)
+
+# =====================================================================
+# 4. REWARD FUNCTIONS ĐÃ ĐƯỢC PHÂN TÁCH TRÁCH NHIỆM
+# =====================================================================
 
 def math_binary_reward(prompts, completions, answer, **kwargs):
-    """Reward 1: Kiểm tra tính đúng đắn của đáp án (Binary 0/1)"""
+    """
+    Reward 1: Điểm Toán học (1.0 hoặc 0.0)
+    Đã nâng cấp: Sử dụng math_verify để kiểm tra tính tương đương toán học.
+    """
     rewards = []
-    for completion, correct_ans in zip(completions, answer):
-        content = completion[0]['content'] if isinstance(completion, list) else completion
+    for comp, ans in zip(completions, answer):
+        content = get_content(comp)
         pred = extract_math_answer(content)
-        clean_gt = extract_ground_truth(correct_ans)
+        gt = extract_ground_truth(ans)
         
-        if pred is not None and pred == clean_gt:
+        # Nếu mô hình không sinh ra thẻ <answer> hoặc không có nội dung
+        if pred is None:
+            rewards.append(0.0)
+            continue
+            
+        # Thử khớp chuỗi tuyệt đối trước (tối ưu tốc độ cho các trường hợp dễ)
+        if pred == gt:
+            rewards.append(1.0)
+            continue
+            
+        # Nếu không khớp chuỗi, dùng thư viện để chấm điểm tương đương
+        try:
+            parsed_pred = parse(pred)
+            parsed_gt = parse(gt)
+            
+            # verify() trả về True nếu hai biểu thức tương đương toán học
+            if verify(parsed_pred, parsed_gt):
+                rewards.append(1.0)
+            else:
+                rewards.append(0.0)
+        except Exception:
+            # Bắt lỗi nếu mô hình sinh ra chuỗi kỳ lạ khiến thư viện không thể parse
+            # (VD: text thường, ký tự rác, cú pháp LaTeX bị hỏng nặng)
+            rewards.append(0.0)
+            
+    return rewards
+
+def strict_format_reward(prompts, completions, **kwargs):
+    """
+    Reward 2: Điểm Định dạng (1.0 hoặc Soft Reward).
+    Thay thế cho standard_format_reward lỏng lẻo cũ.
+    """
+    rewards = []
+    for comp in completions:
+        content = get_content(comp)
+        
+        # Chấm 1.0 nếu đúng form chuẩn
+        if STRICT_FORMAT_PATTERN.search(content):
             rewards.append(1.0)
         else:
-            rewards.append(0.0)
-    return rewards
-
-def standard_format_reward(prompts, completions, **kwargs):
-    """Reward 2: Kiểm tra định dạng cơ bản"""
-    rewards = []
-    for completion in completions:
-        content = completion[0]['content'] if isinstance(completion, list) else completion
-        
-        score = 0.0
-        if "<think>" in content and "</think>" in content:
-            score += 0.5
-        if "<answer>" in content and "</answer>" in content:
-            score += 0.5
+            # Chấm điểm khuyến khích (Soft reward) nếu có thẻ nhưng sai thứ tự/có rác
+            score = 0.0
+            if "<think>" in content and "</think>" in content:
+                score += 0.25
+            if "<answer>" in content and "</answer>" in content:
+                score += 0.25
+            rewards.append(score)
             
-        rewards.append(score)
     return rewards
 
-def dynamic_format_reward(prompts, completions, **kwargs):
+def dynamic_length_penalty(prompts, completions, **kwargs):
     """
-    Reward 3: In-batch Adaptive Length Penalty (DRO-GRPO).
-    Mô hình tự cạnh tranh: Phạt những câu trả lời dài hơn mức trung bình 
-    của các câu đúng định dạng trong cùng một nhóm sinh (batch).
+    Reward 3: Điểm Phạt Độ Dài (0.0 đến -0.5).
+    Chỉ đóng vai trò TRỪ ĐIỂM đối với những câu trả lời đúng format nhưng dài dòng.
     """
-    # Khởi tạo mảng rewards mặc định
     rewards = [0.0] * len(completions)
     
-    # BƯỚC 1: Nhóm các câu trả lời theo từng câu hỏi (Prompt)
-    # GRPOTrainer trả về 1 mảng phẳng, ta cần nhóm num_generations câu lại với nhau
     groups = defaultdict(list)
     for i, prompt in enumerate(prompts):
-        p_str = str(prompt)
-        groups[p_str].append(i)
+        groups[str(prompt)].append(i)
         
-    # BƯỚC 2: Xử lý chấm điểm và phạt cho từng câu hỏi
     for p_str, indices in groups.items():
-        group_contents = []
-        group_format_scores = []
+        group_think_lengths = [] 
+        group_is_valid = []
         
-        # 2.1 Đánh giá định dạng của từng câu trong nhóm
+        # 1. Trích xuất độ dài phần <think>
         for idx in indices:
-            completion = completions[idx]
-            content = completion[0]['content'] if isinstance(completion, list) else completion
-            group_contents.append(content)
+            content = get_content(completions[idx])
+            match = STRICT_FORMAT_PATTERN.search(content)
             
-            format_score = 0.0
-            if "<think>" in content and "</think>" in content and "<answer>" in content and "</answer>" in content:
-                format_score = 1.0
-            group_format_scores.append(format_score)
+            if match:
+                group_think_lengths.append(len(match.group(1))) # Chỉ đếm nội dung trong <think>
+                group_is_valid.append(True)
+            else:
+                group_think_lengths.append(0)
+                group_is_valid.append(False)
             
-        # 2.2 Tính "Chuẩn mực độ dài" (Baseline) của nhóm
-        # Lấy chiều dài của những câu trả lời CÓ ĐỊNH DẠNG ĐÚNG
-        valid_lengths = [len(content) for content, score in zip(group_contents, group_format_scores) if score > 0]
-        
-        # Chuẩn mực = Trung bình cộng chiều dài của các câu đúng.
-        # (Bạn cũng có thể dùng min(valid_lengths) để ép nó học theo câu ngắn nhất)
-        baseline_len = sum(valid_lengths) / len(valid_lengths) if valid_lengths else 0
-        
-        # 2.3 Áp dụng điểm thưởng và phạt
-        for i, idx in enumerate(indices):
-            content = group_contents[i]
-            format_score = group_format_scores[i]
+        # 2. Tính chuẩn mực (Median) dựa trên các mẫu hợp lệ
+        valid_lengths = [
+            length for is_valid, length in zip(group_is_valid, group_think_lengths) 
+            if is_valid
+        ]
+        baseline_len = statistics.median(valid_lengths) if valid_lengths else 0
+            
+        # 3. Tính điểm phạt (Trả về số ÂM)
+        for local_i, idx in enumerate(indices):
+            actual_len = group_think_lengths[local_i]
+            is_valid = group_is_valid[local_i]
             
             penalty = 0.0
-            # Chỉ phạt khi câu này đúng format VÀ nhóm có tiêu chuẩn (baseline_len > 0)
-            if format_score > 0 and baseline_len > 0:
-                actual_len = len(content)
-                if actual_len > baseline_len:
-                    # Công thức: Trừ 0.01 điểm cho mỗi 100 ký tự dài hơn mức trung bình của nhóm
-                    excess = actual_len - baseline_len
-                    penalty = min(0.5, (excess / 100.0) * 0.01)
-            
-            final_score = max(0.0, format_score - penalty)
-            rewards[idx] = final_score
+            if is_valid and baseline_len > 0 and actual_len > baseline_len:
+                ratio = actual_len / baseline_len
+                # Phạt tối đa -0.5
+                penalty = min(0.5, (ratio - 1.0) * 0.2)
+                
+            rewards[idx] = -penalty  # CHÚ Ý: Dấu ÂM để trừ vào tổng điểm
             
     return rewards

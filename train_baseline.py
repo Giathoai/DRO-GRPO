@@ -1,38 +1,58 @@
 import sys
 import os
+import json # THÊM THƯ VIỆN JSON
 import transformers
 import torch
 from datasets import load_dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 from peft import LoraConfig, get_peft_model, PeftModel
+import random
 
 # Importing your reward functions
-from src.rewards import math_binary_reward, standard_format_reward
+from src.rewards import math_binary_reward, strict_format_reward
 
+# =====================================================================
+# CALLBACK 1: LƯU TRẠNG THÁI REWARD CỦA BASELINE
+# =====================================================================
+class MetricsLoggerCallback(TrainerCallback):
+    def __init__(self, log_file="outputs/Baseline_GRPO_Metrics.jsonl"):
+        self.log_file = log_file
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+            
+        metrics_to_save = {"step": state.global_step}
+        for key, value in logs.items():
+            if "reward" in key.lower() or key in ["loss", "epoch"]:
+                metrics_to_save[key] = value
+                
+        if len(metrics_to_save) > 1:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(metrics_to_save) + "\n")
+
+# =====================================================================
+# CALLBACK 2: IN LOG TEXT BASELINE
+# =====================================================================
 class GRPOVisualizerCallback(TrainerCallback):
-    """
-    Callback để in ra quá trình suy luận của mô hình trong lúc train GRPO.
-    """
     def __init__(self, tokenizer, dataset, sample_every=1):
         self.tokenizer = tokenizer
         self.dataset = dataset
         self.sample_every = sample_every
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        # Chỉ in log theo chu kỳ sample_every
         if state.global_step % self.sample_every == 0 and state.global_step > 0:
             model = kwargs['model']
             model.eval()
             
-            # 1. Lấy mẫu ngẫu nhiên
             idx = random.randint(0, len(self.dataset) - 1)
             item = self.dataset[idx]
             
             prompt = item["prompt"]
             ground_truth = item["answer"]
             
-            # 2. Sinh văn bản (Inference)
             inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
             
             with torch.no_grad():
@@ -44,7 +64,6 @@ class GRPOVisualizerCallback(TrainerCallback):
                     pad_token_id=self.tokenizer.pad_token_id
                 )
                 
-                # Cắt bỏ phần prompt để chỉ lấy phần trả lời
                 completion_ids = generated_ids[0][len(inputs.input_ids[0]):]
                 output_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
 
@@ -76,7 +95,7 @@ def format_vietnamese_math(examples):
         "prompt": prompts,
         "answer": examples["solution"],
         "level": examples["level"],
-        "problem": examples["problem"] # Giữ lại để in log
+        "problem": examples["problem"] 
     }
 
 def main():
@@ -109,8 +128,7 @@ def main():
     )
     model = get_peft_model(model, peft_config)
 
-    # Load Dataset
-    configs = ['algebra', 'geometry', 'number_theory'] # Chọn vài tập để test nhanh
+    configs = ['algebra', 'geometry', 'number_theory'] 
     all_splits = []
     for cfg in configs:
         all_splits.append(load_dataset("ura-hcmut/Vietnamese-MATH", cfg, split="train"))
@@ -132,16 +150,16 @@ def main():
         report_to="none"
     )
 
-    # KHỞI TẠO CALLBACK
     visualizer = GRPOVisualizerCallback(tokenizer, dataset, sample_every=1)
+    metrics_logger = MetricsLoggerCallback(log_file="outputs/Baseline_GRPO_Metrics.jsonl")
 
     trainer = GRPOTrainer(
         model=model,
-        reward_funcs=[math_binary_reward, standard_format_reward], 
+        reward_funcs=[math_binary_reward, strict_format_reward], 
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
-        callbacks=[visualizer] # THÊM VÀO ĐÂY
+        callbacks=[visualizer, metrics_logger] # THÊM VÀO ĐÂY
     )
 
     print("🚀 Starting Baseline Training with Debug Logs...")

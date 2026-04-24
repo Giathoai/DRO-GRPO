@@ -1,6 +1,7 @@
 import sys
 import os
 import random
+import json # THÊM THƯ VIỆN JSON
 from unittest.mock import MagicMock
 
 import torch
@@ -11,22 +12,51 @@ from peft import LoraConfig, get_peft_model, PeftModel
 
 # Nạp các module tùy chỉnh của bạn
 from src.trainer import RobustGRPOTrainer
-from src.rewards import math_binary_reward, dynamic_format_reward
+from src.rewards import math_binary_reward, strict_format_reward, dynamic_length_penalty
 
+# =====================================================================
+# CALLBACK 1: LƯU TRẠNG THÁI REWARD ĐỂ VẼ BIỂU ĐỒ SAU NÀY
+# =====================================================================
+class MetricsLoggerCallback(TrainerCallback):
+    """
+    Callback tự động trích xuất các thông số loss, epoch và các hàm reward
+    để lưu vào file JSONL. Rất tiện để dùng Pandas load lên vẽ biểu đồ.
+    """
+    def __init__(self, log_file="outputs/DRO_GRPO_Metrics.jsonl"):
+        self.log_file = log_file
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+        # Nếu muốn ghi đè file cũ mỗi lần chạy lại, bỏ comment dòng dưới:
+        # if os.path.exists(self.log_file): os.remove(self.log_file)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+            
+        # Tạo một dictionary chứa step hiện tại
+        metrics_to_save = {"step": state.global_step}
+        
+        # Lọc ra những tham số liên quan đến reward, loss và epoch
+        for key, value in logs.items():
+            if "reward" in key.lower() or key in ["loss", "epoch"]:
+                metrics_to_save[key] = value
+                
+        # Nếu có dữ liệu để lưu
+        if len(metrics_to_save) > 1:
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(metrics_to_save) + "\n")
+
+# =====================================================================
+# CALLBACK 2: IN LOG SUY LUẬN BẰNG TEXT (Như cũ)
+# =====================================================================
 class GRPOVisualizerCallback(TrainerCallback):
-    """
-    Callback in ra quá trình suy luận và LƯU VÀO FILE TXT.
-    """
     def __init__(self, tokenizer, dataset, sample_every=10, log_file="outputs/DRO_GRPO_Reasoning_Logs.txt"):
         self.tokenizer = tokenizer
         self.dataset = dataset
         self.sample_every = sample_every
         self.log_file = log_file
         
-        # Tạo thư mục chứa file log nếu chưa có
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
         
-        # Tạo file mới và ghi Header (Hỗ trợ UTF-8 cho tiếng Việt)
         with open(self.log_file, "w", encoding="utf-8") as f:
             f.write("=== NHẬT KÝ SUY LUẬN MÔ HÌNH DRO-GRPO ===\n\n")
 
@@ -35,7 +65,6 @@ class GRPOVisualizerCallback(TrainerCallback):
             model = kwargs['model']
             model.eval()
             
-            # Chọn mẫu ngẫu nhiên
             idx = random.randint(0, len(self.dataset) - 1)
             item = self.dataset[idx]
             
@@ -57,7 +86,6 @@ class GRPOVisualizerCallback(TrainerCallback):
                 completion_ids = generated_ids[0][len(inputs.input_ids[0]):]
                 output_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
 
-            # Đóng gói nội dung Log
             log_content = (
                 f"{'='*60}\n"
                 f"🚀 [DRO-GRPO DEBUG] STEP: {state.global_step}\n"
@@ -69,10 +97,7 @@ class GRPOVisualizerCallback(TrainerCallback):
                 f"{'='*60}\n\n"
             )
 
-            # 1. In ra Terminal cho bạn theo dõi trực tiếp
             print(log_content)
-            
-            # 2. Ghi nối (append) vào file .txt
             with open(self.log_file, "a", encoding="utf-8") as f:
                 f.write(log_content)
             
@@ -166,18 +191,19 @@ def main():
         report_to="none",
     )
 
-    # Khởi tạo Visualizer LƯU FILE TXT (Log mỗi 10 steps)
+    # Khởi tạo CẢ 2 Callback
     visualizer = GRPOVisualizerCallback(tokenizer, dataset, sample_every=10, log_file="outputs/DRO_GRPO_Reasoning_Logs.txt")
+    metrics_logger = MetricsLoggerCallback(log_file="outputs/DRO_GRPO_Metrics.jsonl")
 
     trainer = RobustGRPOTrainer(
         model=model,
-        reward_funcs=[math_binary_reward, dynamic_format_reward],
+        reward_funcs=[math_binary_reward, strict_format_reward, dynamic_length_penalty],
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
         dr_temp_start=100.0, 
         dr_temp_end=0.8,     
-        callbacks=[visualizer]
+        callbacks=[visualizer, metrics_logger] # ĐƯA CALLBACK VÀO ĐÂY
     )
 
     print("🚀 Bắt đầu huấn luyện DRO-GRPO (Proposed Method)...")
